@@ -621,32 +621,64 @@ def lstm_recursive_forecast(
 
     future_records = []
 
-    seq = current_seq.copy()
-
     last_date = feature_df.index[-1]
 
-    pred_scaled_history = []
+    rev_hist = (
+        feature_df[target]
+        .iloc[-4:]
+        .tolist()
+    )
 
-    target_idx = final_features.index(target)
+    search_cols = [
+        c for c in final_features
+        if c.startswith("trend_")
+    ]
 
-    for step in range(periods):
+    search_hist = {}
 
-        pred_scaled = model.predict(
-            seq.reshape(
+    for col in search_cols:
+
+        search_hist[col] = (
+            feature_df[col]
+            .iloc[-12:]
+            .tolist()
+        )
+
+    if freq == "Weekly":
+
+        weekly_contrib_quarter_avg = (
+            feature_df.groupby(
+                ['Quarter', 'Week_Number']
+            )['contri_week_quarter']
+            .mean()
+            .to_dict()
+        )
+
+        weekly_contrib_month_avg = (
+            feature_df.groupby(
+                ['Month', 'Week_Number']
+            )['contri_week_month']
+            .mean()
+            .to_dict()
+        )
+
+    current_seq_local = current_seq.copy()
+
+    for i in range(periods):
+
+        pred = model.predict(
+            current_seq_local.reshape(
                 1,
                 lookback,
                 len(final_features)
             ),
             verbose=0
-        )[0, 0]
-
-        pred_scaled_history.append(
-            pred_scaled
         )
 
+        pred_scaled = pred[0, 0]
+
         pred_value = (
-            scaler_y
-            .inverse_transform(
+            scaler_y.inverse_transform(
                 [[pred_scaled]]
             )[0][0]
         )
@@ -661,114 +693,137 @@ def lstm_recursive_forecast(
             next_date = (
                 last_date
                 + pd.Timedelta(
-                    weeks=step + 1
+                    weeks=i+1
                 )
             )
-
-            seasonal_lag = 4
 
         else:
 
             next_date = (
                 last_date
                 + pd.offsets.MonthEnd(
-                    step + 1
+                    i+1
                 )
             )
 
-            seasonal_lag = 3
+        rec = {}
 
-        future_records.append(
-            pd.DataFrame(
-                {
-                    target: [pred_value]
-                },
-                index=[next_date]
-            )
-        )
+        rec['order_date'] = next_date
 
-        next_row = seq[-1].copy()
+        rec['Month'] = next_date.month
 
-        if len(pred_scaled_history) >= 2:
+        rec['Quarter'] = (
+            (next_date.month - 1)//3
+        ) + 1
 
-            momentum = (
-                pred_scaled_history[-1]
-                -
-                pred_scaled_history[-2]
+        if freq == "Weekly":
+
+            rec['Week_Number'] = (
+                next_date.isocalendar().week
             )
 
-        else:
-
-            momentum = 0
-
-        seasonal_reference = (
-            seq[
-                -min(
-                    seasonal_lag,
-                    lookback
-                ),
-                target_idx
-            ]
-        )
-
-        next_target = (
-            0.55 * pred_scaled
-            +
-            0.30 * seasonal_reference
-            +
-            0.15 * (
-                pred_scaled + momentum
-            )
-        )
-
-        next_row[target_idx] = np.clip(
-            next_target,
-            0,
-            1
-        )
-
-        for idx, col in enumerate(final_features):
-
-            if col == target:
-                continue
-
-            hist_mean = np.mean(
-                seq[:, idx]
+            rec['dayofyear'] = (
+                next_date.dayofyear
             )
 
-            hist_std = np.std(
-                seq[:, idx]
+            rec['weekday'] = (
+                next_date.weekday()
             )
 
-            drift = np.random.normal(
-                0,
-                max(
-                    hist_std * 0.15,
-                    0.01
+        for col in search_cols:
+
+            if col in final_features:
+
+                rec[col] = np.mean(
+                    search_hist[col]
+                )
+
+        if freq == "Weekly":
+
+            key_m = (
+                rec['Month'],
+                rec['Week_Number']
+            )
+
+            key_q = (
+                rec['Quarter'],
+                rec['Week_Number']
+            )
+
+            rec['contri_week_month'] = (
+                weekly_contrib_month_avg.get(
+                    key_m,
+                    np.mean(
+                        list(
+                            weekly_contrib_month_avg.values()
+                        )
+                    )
                 )
             )
 
-            next_feature = (
-                0.8 * seq[-1][idx]
-                +
-                0.2 * hist_mean
-                +
-                drift
+            rec['contri_week_quarter'] = (
+                weekly_contrib_quarter_avg.get(
+                    key_q,
+                    np.mean(
+                        list(
+                            weekly_contrib_quarter_avg.values()
+                        )
+                    )
+                )
             )
 
-            next_row[idx] = np.clip(
-                next_feature,
-                0,
-                1
-            )
+        rec['revenue_lag_1'] = rev_hist[-1]
+        rec['revenue_lag_2'] = rev_hist[-2]
+        rec['revenue_lag_3'] = rev_hist[-3]
+        rec['revenue_lag_4'] = rev_hist[-4]
 
-        seq = np.vstack([
-            seq[1:],
-            next_row
+        rec[target] = pred_value
+
+        future_records.append(rec)
+
+        X_new = pd.DataFrame([rec])
+
+        for col in final_features:
+
+            if col not in X_new.columns:
+
+                X_new[col] = (
+                    feature_df[col]
+                    .iloc[-12:]
+                    .mean()
+                )
+
+        X_new = X_new[
+            final_features
+        ]
+
+        X_new_scaled = (
+            scaler_X.transform(X_new)
+        )
+
+        current_seq_local = np.vstack([
+            current_seq_local[1:],
+            X_new_scaled[0]
         ])
 
-    future_df = pd.concat(
+        rev_hist.append(pred_value)
+        rev_hist.pop(0)
+
+        for col in search_cols:
+
+            search_hist[col].append(
+                rec[col]
+            )
+
+            search_hist[col].pop(0)
+
+    future_df = pd.DataFrame(
         future_records
+    )
+
+    future_df.set_index(
+        'order_date',
+        inplace=True
     )
 
     future_df.index = pd.to_datetime(
